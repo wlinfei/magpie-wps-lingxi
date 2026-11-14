@@ -24,6 +24,18 @@ const CLIENT_TYPE = "lingxi_claw"
 const CLIENT_LANG = "zh-CN"
 const RUN_TTL_MS = 60 * 60 * 1000
 
+// ── aigc v3 网页通路（agent-runtime 403 兜底）的常量 ─────────────────────
+// 2026-11 起服务端对 /api/public/v1/agent-runtime/ 强制 WPS2 请求签名（httputil
+// NewWPS2Signer），纯 HTTP 的明文 Cookie 一律 403 PermissionDenied；网页端同款
+// aigc v3 平面（/api/aigc/v3/assistant/sessions + /completions）不需要该签名。
+// 网页聊天只收 question 字符串，工具调用靠文本桥（标记块）往返。
+const WEB_THINKING_OVERRIDE = process.env.MAGPIE_LINGXI_THINKING || ""
+const WEB_WITH_MCP = process.env.MAGPIE_LINGXI_WITH_MCP === "1"
+const TOOL_BRIDGE_ENABLED = process.env.MAGPIE_LINGXI_TOOL_BRIDGE !== "0"
+const TOOL_CALL_BEGIN = "<|FunctionCallBegin|>"
+const TOOL_CALL_END = "<|FunctionCallEnd|>"
+const TOOL_CALL_MAX_BUFFER = 1 << 20
+
 // 上游按 token 限量：实测上限约 150K token（中文填充 ~175 token/KB，混合内容 ~255 token/KB）。
 // 超了不会告诉你「太长」，而是 400「AI服务异常」，整轮失败。320KB 是保守值，留约一半余量。
 const MAX_PROMPT_KB = Math.max(32, Number(process.env.MAGPIE_LINGXI_MAX_PROMPT_KB || 320))
@@ -44,6 +56,51 @@ const KSO_COOKIE_PARTS = [
 function clientCookie(cookie) {
   if (process.env.MAGPIE_LINGXI_NO_KSO === "1") return cookie || ""
   return cookie ? `${cookie}; ${KSO_COOKIE_PARTS.join("; ")}` : KSO_COOKIE_PARTS.join("; ")
+}
+
+// aigc 平面的请求头（与网页端 lingxi-web 一致；runExpertConversationViaAigc 同款）
+function webHeaders(cookie, base = KDOCS_BASE) {
+  return {
+    Cookie: clientCookie(cookie),
+    "Content-Type": "application/json",
+    "X-Cc-Version": "1",
+    "X-Client-Type": "lingxi-web",
+    "X-Cc-Entrance": "default",
+    "User-Agent": UA,
+    Referer: `${base}/`,
+  }
+}
+
+function contentToText(content) {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === "string") return part
+      // 上游 completions 只收文本，图片不能静默丢掉，至少留一个可解释的占位
+      if (part?.type === "image" || part?.type === "image_url" || part?.type === "input_image") return "[image]"
+      return part?.text ?? ""
+    }).join("")
+  }
+  if (content == null) return ""
+  return JSON.stringify(content)
+}
+
+// 客户端下发的 tools（OpenAI 格式）→ 紧凑工具表（网页通路提示词用）
+function normalizeTools(raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  for (const item of raw) {
+    const fn = item?.type === "function" ? item.function : (item?.function ?? item)
+    if (!fn || typeof fn.name !== "string" || !fn.name.trim()) continue
+    const description = typeof fn.description === "string" ? fn.description : ""
+    out.push({
+      name: fn.name,
+      // 工具清单要随每轮提示词重复下发，描述过长只会白白吃掉上下文
+      description: description.length > 240 ? `${description.slice(0, 240)}…` : description,
+      parameters: fn.parameters ?? { type: "object", properties: {} },
+    })
+  }
+  return out
 }
 // 15 天内到期 = 临时积分（与 jet 插件同一判据）；可用 MAGPIE_LINGXI_TEMP_DAYS 调整。
 const TEMP_CREDIT_WINDOW_MS =
@@ -1272,6 +1329,139 @@ function foldFrames(frames) {
   return result
 }
 
+// 上游只有 question 一个入口，工具清单必须写进提示词，模型才知道该调什么
+function toolProtocolPrompt(tools) {
+  return [
+    "[工具协议 · 内部约定，不要向用户复述]",
+    "你可以调用下列工具。需要调用时，只输出一个标记块，格式严格如下：",
+    `${TOOL_CALL_BEGIN}[{"name":"<工具名>","parameters":{...}}]${TOOL_CALL_END}`,
+    "规则：工具名与参数名必须与下面的 schema 完全一致；parameters 必须是 JSON 对象；",
+    "一次可以调用多个工具（数组里放多个对象）；标记块之后不要再输出解释，等待工具结果。",
+    "可用工具：",
+    JSON.stringify(tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }))),
+  ].join("\n")
+}
+
+// 把历史里的 assistant tool_calls 还原成上游认识的信封，供多轮工具循环使用
+function nativeCallBlock(toolCalls) {
+  if (!Array.isArray(toolCalls) || !toolCalls.length) return ""
+  const entries = []
+  for (const call of toolCalls) {
+    const fn = call?.function ?? call ?? {}
+    let parameters = {}
+    if (typeof fn.arguments === "string") {
+      try { parameters = JSON.parse(fn.arguments) } catch { parameters = { raw: fn.arguments } }
+    } else if (fn.arguments && typeof fn.arguments === "object") {
+      parameters = fn.arguments
+    }
+    if (fn.name) entries.push({ name: fn.name, parameters })
+  }
+  if (!entries.length) return ""
+  return `${TOOL_CALL_BEGIN}${JSON.stringify(entries)}${TOOL_CALL_END}`
+}
+
+// 只接受「结构合法 + 工具名在本次请求清单内」的载荷，避免模型讨论这个格式时被误触发
+function parseWebToolCalls(payload, allowed) {
+  let parsed
+  try { parsed = JSON.parse(payload) } catch { return null }
+  const list = Array.isArray(parsed) ? parsed : [parsed]
+  if (!list.length || !allowed.size) return null
+  const calls = []
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") return null
+    const name = entry.name ?? entry.tool ?? entry.function?.name
+    const params = entry.parameters ?? entry.arguments ?? entry.function?.arguments
+    if (typeof name !== "string" || !allowed.has(name)) return null
+    let args
+    if (typeof params === "string") {
+      try { JSON.parse(params) } catch { return null }
+      args = params
+    } else if (params && typeof params === "object" && !Array.isArray(params)) {
+      args = JSON.stringify(params)
+    } else {
+      return null
+    }
+    calls.push({ name, arguments: args })
+  }
+  return calls
+}
+
+// 最长「可能是标记前缀」的后缀长度，流式时先扣住不吐，避免标记被切断后漏到正文
+function partialMarkerLength(text, marker) {
+  const max = Math.min(text.length, marker.length - 1)
+  for (let n = max; n > 0; n--) {
+    if (text.endsWith(marker.slice(0, n))) return n
+  }
+  return 0
+}
+
+function createWebToolCallParser(allowedNames) {
+  const allowed = allowedNames instanceof Set ? allowedNames : new Set(allowedNames || [])
+  let buffer = ""
+  let inCall = false
+
+  function drain(out, final) {
+    for (;;) {
+      if (!inCall) {
+        const at = buffer.indexOf(TOOL_CALL_BEGIN)
+        if (at >= 0) {
+          if (at > 0) out.push({ type: "text", value: buffer.slice(0, at) })
+          buffer = buffer.slice(at + TOOL_CALL_BEGIN.length)
+          inCall = true
+          continue
+        }
+        const hold = final ? 0 : partialMarkerLength(buffer, TOOL_CALL_BEGIN)
+        const cut = buffer.length - hold
+        if (cut > 0) {
+          out.push({ type: "text", value: buffer.slice(0, cut) })
+          buffer = buffer.slice(cut)
+        }
+        return
+      }
+      const at = buffer.indexOf(TOOL_CALL_END)
+      if (at >= 0) {
+        const payload = buffer.slice(0, at)
+        buffer = buffer.slice(at + TOOL_CALL_END.length)
+        inCall = false
+        const calls = parseWebToolCalls(payload, allowed)
+        if (calls) out.push({ type: "calls", calls })
+        else if (payload) out.push({ type: "text", value: TOOL_CALL_BEGIN + payload + TOOL_CALL_END })
+        continue
+      }
+      if (buffer.length > TOOL_CALL_MAX_BUFFER) {
+        out.push({ type: "text", value: TOOL_CALL_BEGIN + buffer })
+        buffer = ""
+        inCall = false
+        return
+      }
+      return
+    }
+  }
+
+  return {
+    push(chunk) {
+      const out = []
+      buffer += chunk
+      drain(out, false)
+      return out
+    },
+    flush() {
+      const out = []
+      drain(out, true)
+      if (inCall) {
+        const calls = parseWebToolCalls(buffer, allowed)
+        if (calls) out.push({ type: "calls", calls })
+        else if (buffer) out.push({ type: "text", value: TOOL_CALL_BEGIN + buffer })
+      } else if (buffer) {
+        out.push({ type: "text", value: buffer })
+      }
+      buffer = ""
+      inCall = false
+      return out
+    },
+  }
+}
+
 async function requestAgent(cookie, run, payload, signal, clientType) {
   const response = await fetch(`${run.base}${AGENT_CHAT_PATH}`, {
     method: "POST",
@@ -1310,6 +1500,335 @@ function chatErrorStatus(error) {
   return status >= 500 ? status : 502
 }
 
+// ── aigc v3 网页通路（agent-runtime 403 时的兜底）───────────────────────
+// 服务端 2026-11 起对 /api/public/v1/agent-runtime/ 强制 WPS2 请求签名（插件纯 HTTP
+// 无法复现），明文 Cookie 一律 403 PermissionDenied。网页端同款 aigc v3 平面
+// （/api/aigc/v3/assistant/sessions + /completions）不需要该签名，实测存活。
+// 它只收一个 question 字符串：system/工具/历史压平成提示词；工具调用靠
+// <|FunctionCallBegin|>…<|FunctionCallEnd|> 文本桥翻回标准 tool_calls。
+// reasoning_effort 0/1/2 → thinking auto/disabled；每轮新建 session（上游同 session
+// 并发会回 event:error），多轮上下文由上游按 session 自动带——但这里每轮新建会话，
+// 所以历史必须压进 question。
+
+function webThinkingModeFor(effort) {
+  if (WEB_THINKING_OVERRIDE === "auto" || WEB_THINKING_OVERRIDE === "disabled") return WEB_THINKING_OVERRIDE
+  return effort === "0" ? "disabled" : "auto"
+}
+
+function flattenMessagesForWeb(messages, tools) {
+  function renderMessage(m) {
+    const text = contentToText(m?.content)
+    if (m?.role === "assistant") {
+      const body = [text, nativeCallBlock(m.tool_calls)].filter(Boolean).join("\n")
+      return body ? `Assistant: ${body}` : ""
+    }
+    if (m?.role === "tool" || m?.role === "function") {
+      return `Tool (${m?.name || m?.tool_call_id || "tool"}): ${text}`
+    }
+    return `User: ${text}`
+  }
+
+  // 同一段 system 在多轮里会重复下发，去重后只保留一份
+  const systemTexts = []
+  for (const m of messages) {
+    if (m?.role !== "system" && m?.role !== "developer") continue
+    const text = contentToText(m.content).trim()
+    if (text && !systemTexts.includes(text)) systemTexts.push(text)
+  }
+
+  // 最后一条是用户消息 → 它才是本次请求；否则（工具结果回灌等）整段按时间顺序保留，
+  // 补一句「继续」，避免把 assistant/tool 消息排到请求前面去。
+  const trailing = messages.length ? messages[messages.length - 1] : null
+  const endsWithUser = trailing?.role === "user"
+  let request
+  let historyMessages = messages
+  if (endsWithUser) {
+    request = contentToText(trailing.content)
+    historyMessages = messages.slice(0, -1)
+  } else if (!messages.length) {
+    request = "你好"
+  } else if (trailing?.role === "tool" || trailing?.role === "function") {
+    request = "（工具已返回结果，请据此继续，不要重复调用同一个工具。）"
+  } else {
+    request = "（请继续。）"
+  }
+
+  const history = []
+  for (const m of historyMessages) {
+    const role = m?.role
+    if (role === "system" || role === "developer") continue
+    const line = renderMessage(m)
+    if (line) history.push(line)
+  }
+
+  const sections = []
+  if (systemTexts.length) sections.push(`SYSTEM:\n${systemTexts.join("\n\n")}`)
+  if (tools.length) sections.push(`TOOLS:\n${toolProtocolPrompt(tools)}`)
+  if (history.length) sections.push(history.join("\n\n"))
+  sections.push(`User: ${request}`)
+  return { question: sections.join("\n\n"), request }
+}
+
+function createWebSession(cookie, base, signal, extra = {}) {
+  return fetch(`${base}/api/aigc/v3/assistant/sessions`, {
+    method: "POST",
+    signal,
+    headers: webHeaders(cookie, base),
+    body: JSON.stringify(extra),
+  })
+}
+
+function sendWebCompletions(cookie, base, sessionId, payload, signal) {
+  return fetch(`${base}/api/aigc/v3/assistant/sessions/${encodeURIComponent(sessionId)}/completions`, {
+    method: "POST",
+    signal,
+    headers: webHeaders(cookie, base),
+    body: JSON.stringify(payload),
+  })
+}
+
+// aigc 平面 SSE → OpenAI chunk 流。帧格式（实测）：
+//   event:execution + data:{"type":"text"|"text_start"|"text_end"|"end"|…, "data":…}
+//   event:finish 结尾（无 usage；无 reasoning 帧）
+// 工具桥标记在 text 流里，由 createWebToolCallParser 截获翻译成 tool_calls delta。
+function webSseStream(upstreamRes, { signal, requestedModel, toolNames }) {
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  const completionId = `chatcmpl-lingxi-web-${Date.now()}`
+  let lineBuffer = "", eventName = "", dataLines = []
+  let sawError = false, ended = false
+  const upstreamError = { message: "WPS 灵犀上游流在完成事件之前结束", type: "upstream_error", code: "incomplete_stream" }
+  const toolParser = TOOL_BRIDGE_ENABLED ? createWebToolCallParser(toolNames) : null
+  let toolCallCount = 0
+
+  function emit(controller, value) {
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`))
+  }
+  function chunk(delta, finishReason = null) {
+    return {
+      id: completionId, object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000), model: requestedModel,
+      choices: [{ delta, index: 0, finish_reason: finishReason }],
+    }
+  }
+  function emitEvents(controller, events) {
+    for (const event of events) {
+      if (event.type === "text") {
+        if (event.value) emit(controller, chunk({ content: event.value }))
+        continue
+      }
+      for (const call of event.calls) {
+        const index = toolCallCount++
+        emit(controller, chunk({
+          tool_calls: [{
+            index,
+            id: `call_${completionId.slice(-13)}_${index}`,
+            type: "function",
+            function: { name: call.name, arguments: call.arguments },
+          }],
+        }))
+      }
+    }
+  }
+  function emitText(controller, text) {
+    if (toolParser) emitEvents(controller, toolParser.push(text))
+    else if (text) emit(controller, chunk({ content: text }))
+  }
+  function flushText(controller) {
+    if (toolParser) emitEvents(controller, toolParser.flush())
+  }
+  function fail(controller, detail) {
+    if (sawError) return
+    sawError = true
+    // 上游 event:error 帧的信封是 { result, msg }（不是 message/hint），原样透传给客户端
+    const message = String(detail?.message || detail?.msg || detail?.hint || "WPS 灵犀上游错误")
+    emit(controller, { error: { message, type: "upstream_error", code: detail?.code || detail?.result || "upstream_error" } })
+  }
+  function dispatch(controller) {
+    const raw = dataLines.join("\n")
+    const name = eventName
+    eventName = ""; dataLines = []
+    if (sawError) return
+    let item
+    try { item = raw ? JSON.parse(raw) : null } catch {
+      fail(controller, { message: "WPS 灵犀上游 SSE 数据无法解析", code: "invalid_sse" }); return
+    }
+    if (name === "error") { fail(controller, item?.error || item); return }
+    if (!item) return
+    if (item.type === "error") { fail(controller, item.error || item.data || item); return }
+    if (item.result && item.result !== "ok" && item.msg) {
+      // event:error 的事件帧：{ result: "AIPPTOutlineError", msg: "…" } 形状
+      fail(controller, { code: item.result, message: item.msg })
+      return
+    }
+    if (ended) return
+    if (item.type === "reasoning" || item.type === "text") {
+      const value = typeof item.data === "object" ? item.data?.text || "" : String(item.data ?? "")
+      if (item.type === "text") emitText(controller, value)
+      else emit(controller, chunk({ reasoning_content: value }))
+      return
+    }
+    if (item.type === "end" || item.type === "text_end") {
+      ended = true
+      flushText(controller)
+      emit(controller, chunk({}, toolCallCount ? "tool_calls" : "stop"))
+    }
+  }
+  function parse(text, controller, final = false) {
+    lineBuffer += text
+    // CRLF、LF、CR 都是合法 SSE 行尾
+    while (true) {
+      const match = /[\r\n]/.exec(lineBuffer)
+      if (!match || (!final && match[0] === "\r" && match.index === lineBuffer.length - 1)) break
+      const line = lineBuffer.slice(0, match.index)
+      const width = lineBuffer.slice(match.index, match.index + 2) === "\r\n" ? 2 : 1
+      lineBuffer = lineBuffer.slice(match.index + width)
+      if (!line) dispatch(controller)
+      else if (line.startsWith("event:")) eventName = line.slice(6).trim()
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""))
+    }
+    if (final) {
+      if (lineBuffer.startsWith("data:")) dataLines.push(lineBuffer.slice(5).replace(/^ /, ""))
+      else if (lineBuffer.startsWith("event:")) eventName = lineBuffer.slice(6).trim()
+      if (eventName || dataLines.length) dispatch(controller)
+    }
+  }
+  const streamTransform = new TransformStream({
+    transform(chunkData, controller) { parse(decoder.decode(chunkData, { stream: true }), controller) },
+    flush(controller) {
+      parse(decoder.decode(), controller, true)
+      if (!ended && !sawError) fail(controller, upstreamError)
+      if (!sawError) controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+    },
+  })
+  return upstreamRes.body.pipeThrough(streamTransform)
+}
+
+// 非流式：跑同一条 SSE 解析，把 chunk 聚合成一个 chat.completion 响应
+async function webAggregate(upstreamRes, { signal, requestedModel, toolNames }) {
+  const reader = webSseStream(upstreamRes, { signal, requestedModel, toolNames }).getReader()
+  const decoder = new TextDecoder()
+  let fullContent = ""
+  let reasoning = ""
+  const toolCalls = []
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      for (const l of decoder.decode(value).split("\n")) {
+        if (!l.startsWith("data: ") || l.includes("[DONE]")) continue
+        try {
+          const p = JSON.parse(l.slice(6))
+          if (p?.error) throw new Error(p.error.message || "WPS 灵犀上游错误")
+          const delta = p.choices?.[0]?.delta
+          if (delta?.error) throw new Error(delta.error.message || "WPS 灵犀上游错误")
+          fullContent += delta?.content || ""
+          reasoning += delta?.reasoning_content || ""
+          for (const call of delta?.tool_calls || []) {
+            const slot = (toolCalls[call.index] ??= {
+              id: call.id, type: "function", function: { name: "", arguments: "" },
+            })
+            if (call.id) slot.id = call.id
+            if (call.function?.name) slot.function.name += call.function.name
+            if (call.function?.arguments) slot.function.arguments += call.function.arguments
+          }
+        } catch {}
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const message = { role: "assistant", content: toolCalls.length ? (fullContent || null) : fullContent }
+  if (reasoning) message.reasoning_content = reasoning
+  if (toolCalls.length) message.tool_calls = toolCalls
+  return {
+    id: `chatcmpl-lingxi-web-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: requestedModel,
+    choices: [{ index: 0, message, finish_reason: toolCalls.length ? "tool_calls" : "stop" }],
+  }
+}
+
+// 主兜底入口：agent-runtime 报 403（PermissionDenied）时改走 aigc v3 网页通路。
+// 返回 Response 或 null（null = 不适用，让调用方继续抛原错误）。
+async function webFallbackChat({ cookie, body, stream, requestedModel, signal, errorResponse, base }) {
+  const host = base || KDOCS_BASE
+  const tools = TOOL_BRIDGE_ENABLED ? normalizeTools(body.tools) : []
+  const toolNames = new Set(tools.map((t) => t.name))
+
+  // 网页通路的提示词上下文上限比原生小，压平前先按同样规则裁剪
+  const clipped = { ...body, messages: [...(Array.isArray(body.messages) ? body.messages : [])] }
+  fitAgentBody(clipped)
+  const { question } = flattenMessagesForWeb(clipped.messages, tools)
+
+  // reasoning_effort / reasoning 大小档 → 上游 0/1/2
+  const effortRaw = body.reasoning_effort ?? body.reasoningEffort ?? body.thinking_level
+  const effortMap = { low: "0", high: "1", max: "2", "0": "0", "1": "1", "2": "2" }
+  const normalizedEffort = effortRaw == null || effortRaw === "" || !Object.hasOwn(effortMap, String(effortRaw))
+    ? undefined : effortMap[String(effortRaw)]
+
+  let sessionId
+  try {
+    const sessRes = await createWebSession(cookie, host, signal)
+    if (!sessRes.ok) {
+      const text = await sessRes.text().catch(() => "")
+      throw new Error(`WPS 灵犀网页会话创建失败: HTTP ${sessRes.status} ${text.slice(0, 120)}`)
+    }
+    const sessData = await sessRes.json().catch(() => ({}))
+    sessionId = String(sessData?.data?.session_id ?? "")
+    if (!sessionId) throw new Error("WPS 灵犀网页会话未返回 session_id")
+  } catch (error) {
+    signal?.throwIfAborted()
+    return errorResponse(error.message, 502, "upstream_error")
+  }
+
+  const payload = {
+    question,
+    expect_model: requestedModel,
+    model: requestedModel,
+    thinking: webThinkingModeFor(normalizedEffort),
+    with_mcp: WEB_WITH_MCP,
+    with_expert: false,
+  }
+  if (normalizedEffort !== undefined) payload.reasoning_effort = normalizedEffort
+
+  let upstreamRes
+  try {
+    upstreamRes = await sendWebCompletions(cookie, host, sessionId, payload, signal)
+  } catch (error) {
+    signal?.throwIfAborted()
+    return errorResponse("WPS 灵犀网页通路请求失败", 502, "upstream_error")
+  }
+
+  if (!upstreamRes.ok || !upstreamRes.body) {
+    const errText = await upstreamRes.text().catch(() => "")
+    return errorResponse(
+      `WPS 灵犀网页通路响应异常: HTTP ${upstreamRes.status} ${errText.slice(0, 200)}`,
+      upstreamRes.status >= 500 ? upstreamRes.status : 502,
+      "upstream_error",
+    )
+  }
+
+  if (!stream) {
+    try {
+      const folded = await webAggregate(upstreamRes, { signal, requestedModel, toolNames })
+      return new Response(JSON.stringify(folded), { headers: { "Content-Type": "application/json" } })
+    } catch (error) {
+      signal?.throwIfAborted()
+      return errorResponse(error.message, 502, "incomplete_stream")
+    }
+  }
+
+  return new Response(webSseStream(upstreamRes, { signal, requestedModel, toolNames }), {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  })
+}
+
 async function agentChat({ cookie, body, stream, requestedModel, signal, errorResponse, clientType, sessionMode }) {
   if (!isChatModelId(requestedModel)) {
     return errorResponse(`WPS 灵犀不支持此聊天模型：${requestedModel}`, 404, "model_not_found")
@@ -1329,6 +1848,17 @@ async function agentChat({ cookie, body, stream, requestedModel, signal, errorRe
   try {
     response = await requestAgent(cookie, run, payload, signal, clientType)
   } catch (error) {
+    // agent-runtime 403 PermissionDenied = 服务端强制 WPS2 签名（2026-11 起），
+    // 参数怎么改都过不去 → 改走 aigc v3 网页通路（不需要签名，实测存活）。
+    // audit 拦截与 stale-run 是另一类问题，保持原处理。
+    if (Number(error?.status) === 403 && !isAuditError(error) &&
+        !/unauthor|登录|凭据|credential|cookie|sid/i.test(String(error?.message || ""))) {
+      runs.delete(key)
+      console.warn(
+        `[magpie-wps-lingxi] 模型 ${requestedModel} 被原生 agent-runtime 拒绝（403），改走网页通路`,
+      )
+      return await webFallbackChat({ cookie, body, stream, requestedModel, signal, errorResponse, base: run.base })
+    }
     if (isAuditError(error) || !looksLikeStaleRun(error.message)) throw error
     runs.delete(key)
     run = await ensureRun(cookie, key, requestedModel, lastUserText(body), signal, sessionExtra, runExtra)

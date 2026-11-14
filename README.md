@@ -30,13 +30,16 @@ Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
 
 ## 🌟 核心特性
 
-- 🖥 **只走桌面客户端通路**  
-  与安装包里的 app-server 完全一致：`POST /api/aioffice/v1/cowork/sessions` 建会话 →
+- 🖥 **桌面客户端通路为主，网页通路自动兜底**  
+  主路与安装包里的 app-server 完全一致：`POST /api/aioffice/v1/cowork/sessions` 建会话 →
   `POST /api/public/v1/credits/runs` 领 run → `POST /api/public/v1/agent-runtime/chat/completions` 对话。
   原生 `messages` / `tools` 进，原生 `tool_calls` / `reasoning_content` / `usage` 出。
-- 🧹 **没有网页平面**  
-  旧的 `/api/aigc/v3/assistant/...` 通路、`question` 压平、`<|FunctionCallBegin|>` 正文工具桥全部删除；
-  不存在“有 tools 走一条、没 tools 走另一条”的分叉。
+- 🛡 **agent-runtime 403 自动回落 aigc 网页通路（2026-11 新增）**  
+  服务端对 `agent-runtime/` 强制 WPS2 请求签名（`httputil.NewWPS2Signer`），纯 HTTP 的
+  明文 Cookie 一律 `403 PermissionDenied`（issue #13）。chat 阶段遇到 403 时，插件自动
+  改走网页端同款 `POST /api/aigc/v3/assistant/sessions` + `/completions`（不需要该签名）：
+  system/工具/历史压平成 `question`，`<|FunctionCallBegin|>` 文本桥把正文里的工具调用
+  翻回标准 `tool_calls`；`reasoning_effort` 映射成 `thinking`。全部 11 个模型实测可用。
 - 🎁 **每日签到 + 一次性任务 (`auth.checkin`)**  
   读客户端任务中心 `GET /api/public/v1/tasks`，领取 `daily_check_in`；
   已领过返回 `done`，领到返回 `claimed` 并用领前/领后余额差作为奖励。
@@ -60,7 +63,9 @@ Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
 
 ---
 
-## 🔌 对话通路（唯一一条）
+## 🔌 对话通路（主路 + 兜底）
+
+**主路（桌面客户端通路）**：
 
 | 步骤 | 请求 | 说明 |
 |---|---|---|
@@ -75,13 +80,29 @@ Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
 - 请求头（与客户端一致）：`X-Client-Type: lingxi_claw`、`X-Client-Lang: zh-CN`、
   `X-Cc-Agent-Type: lingxi_claw`，Cookie 带 `copilot_server_branch` 时再加 `X-Cc-Region`。
 
+**兜底（aigc v3 网页通路，chat 阶段 403 时自动启用）**：
+
+| 步骤 | 请求 | 说明 |
+|---|---|---|
+| 1 | `POST /api/aigc/v3/assistant/sessions` | 空 body，返回 `session_id`（每轮新建，上游同 session 并发回 `event:error`） |
+| 2 | `POST /api/aigc/v3/assistant/sessions/{id}/completions` | `{question, expect_model, model, thinking, with_mcp, with_expert:false, reasoning_effort?}` |
+
+- 请求头（与网页端一致）：`X-Cc-Version: 1`、`X-Client-Type: lingxi-web`、`X-Cc-Entrance: default`。
+- SSE 帧：`event:execution` + `data:{"type":"text"|"text_start"|"text_end"|"end"|"recommend"…}`，
+  `event:finish` 结尾；`event:error` 的事件帧信封是 `{result, msg}`（不是 `message`）。
+- 工具调用走正文文本桥：模型按提示词约定输出 `<|FunctionCallBegin|>[{"name":…,"parameters":…}]<|FunctionCallEnd|>`，
+  插件截获后翻译成标准 OpenAI `tool_calls` delta（finish_reason=`tool_calls`）。
+  网页模型可能自带搜索抢答（不调工具）；`MAGPIE_LINGXI_WITH_MCP=1` 打开内置搜索，
+  置 `0` 关闭。相关环境变量：`MAGPIE_LINGXI_THINKING`（强制 `auto`/`disabled`）、
+  `MAGPIE_LINGXI_TOOL_BRIDGE=0`（关闭文本桥）。
+
 ---
 
 ## ✅ 与桌面客户端对齐清单（1.3.31）
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| 对话端点 | ✅ | 只有 `agent-runtime/chat/completions`；网页通路已删 |
+| 对话端点 | ✅ | 主路 `agent-runtime/chat/completions`；chat 阶段 403 时自动回落 aigc v3 网页通路 |
 | 会话 / run | ✅ | cowork 会话 + credits/runs，`session_type:"cowork_client"`、`agent_version:2` |
 | 请求头 | ✅ | `X-Client-Type`、`X-Client-Lang`、`X-Cc-Agent-Type`、`X-Cc-Session-ID`、`X-Cc-Run-ID`、`X-Request-Id`；有 `copilot_server_branch` 时带 `X-Cc-Region` |
 | 模型目录 | ✅ | 登录后只取 `sessions/plans` 的 `data.models`；未登录用真实模型快照 |

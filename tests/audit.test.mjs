@@ -7,6 +7,8 @@ let sequence = 0
 const chatPath = '/api/public/v1/agent-runtime/chat/completions'
 const sessionPath = '/api/aioffice/v1/cowork/sessions'
 const runPath = '/api/public/v1/credits/runs'
+const webSessionPath = '/api/aigc/v3/assistant/sessions'
+const webChatPath = '/api/aigc/v3/assistant/sessions/w1/completions'
 const refusal = '我还在不断学习中，暂时无法回答此问题，请尝试重新提问'
 
 async function exercise({ phase = chatPath, reply, stream = false, verify }) {
@@ -26,6 +28,16 @@ async function exercise({ phase = chatPath, reply, stream = false, verify }) {
     if (path === phase) return reply()
     if (path === sessionPath) return Response.json({ code: 'Success', data: { session_id: 's1' } })
     if (path === runPath) return Response.json({ code: 'Success', data: { run_id: 'r1' } })
+    // 403 兜底的网页通路：aigc 会话 + SSE completions（正文一帧 + end）
+    if (path === webSessionPath) return Response.json({ data: { session_id: 'w1' } })
+    if (path === webChatPath) {
+      const frames = [
+        `event: execution\ndata: ${JSON.stringify({ type: 'text', data: { text: 'web-ok' } })}\n\n`,
+        `event: execution\ndata: ${JSON.stringify({ type: 'end' })}\n\n`,
+        'event: finish\ndata: {}\n\n',
+      ]
+      return new Response(frames.join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
     throw new Error(`unexpected upstream call: ${url}`)
   }
   try {
@@ -112,7 +124,7 @@ for (const phase of [sessionPath, runPath, chatPath]) {
 for (const [status, message, expected] of [
   [400, 'unknown model', 404], [404, 'model not found', 404],
   [422, 'invalid parameter', 404], [401, 'cookie unauthorized', 401],
-  [403, 'permission denied', 404], [503, 'unavailable', 503],
+  [503, 'unavailable', 503],
   [400, '审核服务异常', 404], [400, 'NotAuditFailedYet', 404],
 ]) {
   test(`non-audit classification remains ${status}/${message} -> ${expected}`, async () => {
@@ -125,6 +137,50 @@ for (const [status, message, expected] of [
     })
   })
 }
+
+// 2026-11 起服务端对 agent-runtime 强制 WPS2 签名：纯 HTTP 明文 Cookie 一律
+// 403 PermissionDenied（issue #13 同现象）。插件契约变更：chat 阶段的 403
+// （非 audit、非登录失效）改为自动回落 aigc v3 网页通路，而不是映射成 404。
+test('403 permission denied at chat phase falls back to the aigc web plane', async () => {
+  await exercise({
+    reply: () => Response.json({ code: 'PermissionDenied', message: '无权限' }, { status: 403 }),
+    verify({ response, text, calls }) {
+      assert.equal(response.status, 200)
+      const parsed = JSON.parse(text)
+      assert.equal(parsed.choices[0].message.content, 'web-ok')
+      assert.equal(parsed.choices[0].finish_reason, 'stop')
+      assert.equal(calls.filter(c => c.path === chatPath).length, 1)
+      assert.equal(calls.filter(c => c.path === webSessionPath).length, 1)
+      assert.equal(calls.filter(c => c.path === webChatPath).length, 1)
+    },
+  })
+})
+
+// 登录失效（403 + 鉴权关键词）不触发网页通路：账号问题换通路解决不了，必须让用户重登。
+test('403 with auth keywords stays 401 without web fallback', async () => {
+  await exercise({
+    reply: () => Response.json({ message: '登录已失效，请重新登录' }, { status: 403 }),
+    verify({ response, text, calls }) {
+      assert.equal(response.status, 401)
+      assert.equal(JSON.parse(text).error.code, 'upstream_error')
+      assert.equal(calls.filter(c => c.path === webSessionPath).length, 0)
+    },
+  })
+})
+
+// 403 兜底在 session/run 阶段不生效（run 建不出来时 chat 还没发生）。
+// postJson 给 403 补的 hint 含「登录」→ 既有映射归 401（与改动前一致）。
+test('403 at session phase still maps to 401 without web fallback', async () => {
+  await exercise({
+    phase: sessionPath,
+    reply: () => Response.json({ message: '无权限' }, { status: 403 }),
+    verify({ response, text, calls }) {
+      assert.equal(response.status, 401)
+      assert.equal(JSON.parse(text).error.code, 'upstream_error')
+      assert.equal(calls.filter(c => c.path === webSessionPath).length, 0)
+    },
+  })
+})
 
 for (const stream of [false, true]) {
   for (const partial of [false, true]) {
